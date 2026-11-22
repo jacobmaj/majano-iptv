@@ -42,6 +42,8 @@ class Store(c: Context) {
     private val sp = c.getSharedPreferences("majano", 0)
     var external: Boolean get() = sp.getBoolean("ext", false); set(v) { sp.edit().putBoolean("ext", v).apply() }
     var subs: Boolean get() = sp.getBoolean("subs", false); set(v) { sp.edit().putBoolean("subs", v).apply() }
+    var audioLang: String get() = sp.getString("alang", "es")!!; set(v) { sp.edit().putString("alang", v).apply() }
+    var boostMb: Int get() = sp.getInt("boost", 1000); set(v) { sp.edit().putInt("boost", v).apply() }
     var parental: Boolean get() = sp.getBoolean("parental", true); set(v) { sp.edit().putBoolean("parental", v).apply() }
     var active: Int get() = sp.getInt("active", 0); set(v) { sp.edit().putInt("active", v).apply() }
 
