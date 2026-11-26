@@ -17,11 +17,14 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -29,6 +32,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.window.Dialog
 import androidx.media3.common.MediaItem
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
@@ -69,17 +73,20 @@ fun Browser(kind: String, bs: BrowseState, api: Api, st: Store, active: Boolean,
     }
     val d = bs.data
     val hidden = remember(bs.hv) { st.hidden(kind) }
+    val hiddenI = remember(bs.hv) { st.hiddenItems(kind) }
     val blocked = remember(d, bs.hv) { hidden + (if (st.parental) api.adultIds(kind) else emptySet()) }
-    val items = remember(d, bs.cat, bs.q, bs.fv, blocked) {
+    val items = remember(d, bs.cat, bs.q, bs.fv, blocked, hiddenI) {
         if (d == null) emptyList() else {
             val base = when (bs.cat) { "#fav" -> st.favs(kind); "#seen" -> st.history(kind); null -> d.second; else -> d.second.filter { it.cat == bs.cat } }
-            base.filter { it.cat !in blocked && (bs.q.isBlank() || it.name.contains(bs.q, true)) }
+            base.filter { it.cat !in blocked && it.id !in hiddenI && (bs.q.isBlank() || it.name.contains(bs.q, true)) }
         }
     }
     val counts = remember(d) { d?.second?.groupingBy { it.cat }?.eachCount() ?: emptyMap() }
     val b = BCtx(kind, bs, api, st, items, d, blocked, counts)
     var menu by remember { mutableStateOf<Item?>(null) }
     var catMenu by remember { mutableStateOf<String?>(null) }
+    var catchup by remember { mutableStateOf<Item?>(null) }
+    var renaming by remember { mutableStateOf<Item?>(null) }
     val selFr = remember { FocusRequester() }
     val epFr = remember { FocusRequester() }
     val catFr = remember { FocusRequester() }
@@ -126,7 +133,7 @@ fun Browser(kind: String, bs: BrowseState, api: Api, st: Store, active: Boolean,
         if (compact && bs.detail && sel != null) {
             Column(Modifier.fillMaxSize()) {
                 Chip("‹ Volver", m = Modifier.padding(12.dp)) { bs.detail = false }
-                DetailPane(b, pv, epFr, play, { playLive(it) }, Modifier.weight(1f).fillMaxWidth())
+                DetailPane(b, pv, epFr, play, { playLive(it) }, { catchup = it }, Modifier.weight(1f).fillMaxWidth())
             }
         } else if (compact) {
             Column(Modifier.fillMaxSize()) {
@@ -148,23 +155,36 @@ fun Browser(kind: String, bs: BrowseState, api: Api, st: Store, active: Boolean,
                     TopBar(b) { refresh++ }
                     ItemList(b, selFr, { pick(it) }, { menu = it }, Modifier.weight(1f).fillMaxWidth())
                 }
-                DetailPane(b, pv, epFr, play, { playLive(it) }, Modifier.width(rightW).fillMaxHeight())
+                DetailPane(b, pv, epFr, play, { playLive(it) }, { catchup = it }, Modifier.width(rightW).fillMaxHeight())
             }
         }
 
-        // OK sostenido: Reproducir / Favoritos
+        // OK sostenido: Reproducir / Favoritos / Renombrar / Ocultar / Catch-up
         menu?.let { x ->
             val fav = st.isFav(x)
-            ActionDialog(x.name, listOf(
-                act(when (kind) { "live" -> "▶ Reproducir"; "movie" -> "▶ Reproducir película"; else -> "▶ Ver temporadas y capítulos" }) {
-                    bs.sel = x
-                    if (kind == "live") playLive(x)
-                    else if (kind == "movie") playMovie(x)
-                    else { bs.season = -1; if (compact) bs.detail = true }
-                    Unit
-                },
-                act(if (fav) "★ Quitar de favoritos" else "☆ Agregar a favoritos") { st.toggleFav(x); bs.fv++ }
-            )) { menu = null }
+            val acts = ArrayList<Pair<String, () -> Unit>>()
+            acts += act(when (kind) { "live" -> "▶ Reproducir"; "movie" -> "▶ Reproducir película"; else -> "▶ Ver temporadas y capítulos" }) {
+                bs.sel = x
+                if (kind == "live") playLive(x)
+                else if (kind == "movie") playMovie(x)
+                else { bs.season = -1; if (compact) bs.detail = true }
+                Unit
+            }
+            acts += act(if (fav) "★ Quitar de favoritos" else "☆ Agregar a favoritos") { st.toggleFav(x); bs.fv++ }
+            if (bs.cat == "#fav" && fav) {
+                acts += act("▲ Subir en favoritos") { st.moveFav(x, -1); bs.fv++ }
+                acts += act("▼ Bajar en favoritos") { st.moveFav(x, 1); bs.fv++ }
+            }
+            if (kind == "live" && x.arch) acts += act("⏪ Catch-up (programas pasados)") { bs.sel = x; catchup = x }
+            acts += act("✎ Renombrar") { renaming = x }
+            acts += act("Ocultar este elemento") { st.toggleHiddenItem(kind, x.id); if (bs.sel?.id == x.id) bs.sel = null; bs.hv++ }
+            ActionDialog(st.nameOf(x), acts) { menu = null }
+        }
+        renaming?.let { x -> TextDialog("Renombrar", st.nameOf(x), { renaming = null }) { n -> st.rename(x, n); bs.fv++ } }
+        catchup?.let { x ->
+            CatchupDialog(api, x, { catchup = null }) { e ->
+                play(listOf(PI("${x.name} · ${e.title}", api.catchupUrl(x, e), "cu:${x.id}:${e.start}", false, x)), 0)
+            }
         }
         catMenu?.let { id ->
             ActionDialog(d?.first?.get(id) ?: "Categoría", listOf(act("Ocultar esta categoría") { st.toggleHidden(kind, id); if (bs.cat == id) bs.cat = null; bs.hv++ })) { catMenu = null }
@@ -175,13 +195,16 @@ fun Browser(kind: String, bs: BrowseState, api: Api, st: Store, active: Boolean,
 @Composable
 fun TopBar(b: BCtx, onRefresh: () -> Unit) {
     val bs = b.bs
+    val voice = rememberVoice { bs.q = it }
+    val narrow = LocalConfiguration.current.screenWidthDp < 600
     val name = when (bs.cat) { null -> "Todos"; "#fav" -> "Favoritos"; "#seen" -> "Vistos"; else -> b.d?.first?.get(bs.cat) ?: "" }
     Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         Column(Modifier.weight(1f)) {
             Text(name.ifEmpty { "Sin grupo" }, fontSize = 18.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
             Text("${b.items.size} elementos", fontSize = 11.sp, color = Ui.dim)
         }
-        OutlinedTextField(bs.q, { bs.q = it }, Modifier.width(170.dp), placeholder = { Text("Buscar…", fontSize = 13.sp) }, singleLine = true, textStyle = TextStyle(fontSize = 14.sp))
+        OutlinedTextField(bs.q, { bs.q = it }, Modifier.width(if (narrow) 110.dp else 170.dp), placeholder = { Text("Buscar…", fontSize = 13.sp) }, singleLine = true, textStyle = TextStyle(fontSize = 14.sp))
+        Chip("Voz", onClick = voice)
         Chip("↻", onClick = onRefresh)
     }
 }
@@ -230,77 +253,107 @@ fun ItemList(b: BCtx, selFr: FocusRequester, onPick: (Item) -> Unit, onMenu: (It
         LazyColumn(m, state = bs.list, contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             itemsIndexed(b.items) { i, x ->
                 val s = bs.sel?.id == x.id
-                ChannelRow(i + 1, x, s, tick >= 0 && b.st.isFav(x), if (s) Modifier.focusRequester(selFr) else Modifier, { onMenu(x) }) { onPick(x) }
+                ChannelRow(i + 1, x, s, tick >= 0 && b.st.isFav(x), if (s) Modifier.focusRequester(selFr) else Modifier, { onMenu(x) }, if (tick >= 0) b.st.nameOf(x) else x.name, b.api) { onPick(x) }
             }
         }
     } else {
-        LazyVerticalGrid(GridCells.Adaptive(112.dp), m, state = bs.grid, contentPadding = PaddingValues(12.dp),
+        LazyVerticalGrid(GridCells.Adaptive((112 * Ui.textScale).dp), m, state = bs.grid, contentPadding = PaddingValues(12.dp),
             horizontalArrangement = Arrangement.spacedBy(10.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             items(b.items) { x ->
                 val s = bs.sel?.id == x.id
                 PosterCard(x, s, tick >= 0 && b.st.isFav(x), if (bs.cat == "#seen") b.st.progressOf(x) else 0f,
-                    if (s) Modifier.focusRequester(selFr) else Modifier, { onMenu(x) }) { onPick(x) }
+                    if (s) Modifier.focusRequester(selFr) else Modifier, { onMenu(x) }, if (tick >= 0) b.st.nameOf(x) else x.name) { onPick(x) }
             }
         }
     }
 }
 
 @Composable
-fun ChannelRow(n: Int, x: Item, sel: Boolean, fav: Boolean, m: Modifier, onLong: () -> Unit, onClick: () -> Unit) {
+fun ChannelRow(n: Int, x: Item, sel: Boolean, fav: Boolean, m: Modifier, onLong: () -> Unit, name: String, api: Api, onClick: () -> Unit) {
+    // "ahora" de la guía, solo para filas visibles y con un pequeño retraso para no saturar al proveedor al desplazarse
+    val nowT by produceState("", x.id) {
+        delay(300)
+        val t = System.currentTimeMillis() / 1000
+        value = withContext(Dispatchers.IO) { api.epgCached(x.id).firstOrNull { t in it.start until it.end }?.title ?: "" }
+    }
     Row(m.fillMaxWidth().tv(RoundedCornerShape(12.dp), onLong, onClick).background(if (sel) Ui.s3 else Ui.s1).padding(horizontal = 10.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
         Text("$n", fontSize = 12.sp, color = Ui.dim, modifier = Modifier.width(30.dp))
-        Box(Modifier.size(44.dp).clip(RoundedCornerShape(8.dp)).background(Ui.s2), contentAlignment = Alignment.Center) {
-            AsyncImage(model = x.icon, contentDescription = null, modifier = Modifier.fillMaxSize().padding(3.dp), contentScale = ContentScale.Fit)
+        Logo(x, Modifier.size(44.dp).clip(RoundedCornerShape(8.dp)).background(Ui.s2).padding(3.dp))
+        Column(Modifier.weight(1f)) {
+            Text(name, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            if (nowT.isNotEmpty()) Text(nowT, fontSize = 11.sp, color = Ui.dim, maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
-        Text(x.name, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+        if (x.arch) Text("⏪", fontSize = 12.sp, color = Ui.dim)
         if (fav) Text("★", color = Ui.acc)
     }
 }
 
 @Composable
-fun PosterCard(x: Item, sel: Boolean, fav: Boolean, prog: Float, m: Modifier, onLong: () -> Unit, onClick: () -> Unit) {
+fun PosterCard(x: Item, sel: Boolean, fav: Boolean, prog: Float, m: Modifier, onLong: () -> Unit, name: String = x.name, onClick: () -> Unit) {
     Column(m.tv(RoundedCornerShape(12.dp), onLong, onClick).background(if (sel) Ui.s3 else Ui.s1)) {
         Box {
-            AsyncImage(model = x.icon, contentDescription = null, modifier = Modifier.fillMaxWidth().aspectRatio(0.68f), contentScale = ContentScale.Crop)
+            Logo(x, Modifier.fillMaxWidth().aspectRatio(0.68f), ContentScale.Crop)
             if (fav) Text("★", color = Ui.acc, modifier = Modifier.align(Alignment.TopEnd).padding(6.dp))
             if (prog > 0f) Box(Modifier.align(Alignment.BottomStart).fillMaxWidth().height(4.dp).background(Color(0x66000000))) {
                 Box(Modifier.fillMaxWidth(prog).fillMaxHeight().background(Ui.acc))
             }
         }
-        Text(x.name, fontSize = 12.sp, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(8.dp))
+        Text(name, fontSize = 12.sp, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(8.dp))
     }
 }
 
 @Composable
-fun DetailPane(b: BCtx, pv: ExoPlayer?, epFr: FocusRequester, play: (List<PI>, Int) -> Unit, playLive: (Item) -> Unit, m: Modifier) {
+fun DetailPane(b: BCtx, pv: ExoPlayer?, epFr: FocusRequester, play: (List<PI>, Int) -> Unit, playLive: (Item) -> Unit, onCatchup: (Item) -> Unit, m: Modifier) {
     val x = b.bs.sel
-    Column(m.background(Ui.s1)) {
-        if (x == null) {
-            Box(Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
-                Text(when (b.kind) { "live" -> "Elige un canal para ver la vista previa"; "movie" -> "Elige una película"; else -> "Elige una serie" }, color = Ui.dim)
-            }
-            return@Column
+    Box(m.background(Ui.s1)) {
+        // Fondo difuminado con la carátula (estilo streaming)
+        if (x != null && b.kind != "live" && x.icon.isNotBlank()) {
+            AsyncImage(model = x.icon, contentDescription = null, modifier = Modifier.fillMaxSize().blur(24.dp), contentScale = ContentScale.Crop, alpha = 0.30f)
+            Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color(0x33000000), Ui.s1))))
         }
-        when (b.kind) {
-            "live" -> LivePane(b, x, pv) { playLive(x) }
-            "movie" -> MoviePane(b, x, play)
-            else -> SeriesPane(b, x, epFr, play)
+        Column(Modifier.fillMaxSize()) {
+            if (x == null) {
+                Box(Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
+                    Text(when (b.kind) { "live" -> "Elige un canal para ver la vista previa"; "movie" -> "Elige una película"; else -> "Elige una serie" }, color = Ui.dim)
+                }
+            } else when (b.kind) {
+                "live" -> LivePane(b, x, pv, onCatchup) { playLive(x) }
+                "movie" -> MoviePane(b, x, play)
+                else -> SeriesPane(b, x, epFr, play)
+            }
         }
     }
 }
 
 @Composable
-fun LivePane(b: BCtx, x: Item, pv: ExoPlayer?, onFull: () -> Unit) {
+fun LivePane(b: BCtx, x: Item, pv: ExoPlayer?, onCatchup: (Item) -> Unit, onFull: () -> Unit) {
     val fav = b.bs.fv >= 0 && b.st.isFav(x)
+    val epg by produceState<List<Epg>>(emptyList(), x.id) { value = withContext(Dispatchers.IO) { runCatching { b.api.epg(x.id) }.getOrDefault(emptyList()) } }
     Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Box(Modifier.fillMaxWidth().aspectRatio(16f / 9f).clip(RoundedCornerShape(14.dp)).background(Color.Black)) {
             if (pv != null) AndroidView({ c -> PlayerView(c).apply { useController = false; isFocusable = false; isFocusableInTouchMode = false } }, Modifier.fillMaxSize(), update = { it.player = pv })
         }
-        Text(x.name, fontSize = 18.sp, fontWeight = FontWeight.Bold, maxLines = 2, overflow = TextOverflow.Ellipsis)
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Logo(x, Modifier.size(40.dp).clip(RoundedCornerShape(8.dp)).background(Ui.s2))
+            Text(b.st.nameOf(x), fontSize = 18.sp, fontWeight = FontWeight.Bold, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+        }
+        val now = System.currentTimeMillis() / 1000
+        val ci = epg.indexOfFirst { now in it.start until it.end }
+        if (ci >= 0) {
+            val e = epg[ci]
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text("Ahora: ${e.title}", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                Box(Modifier.fillMaxWidth().height(4.dp).background(Ui.s3)) {
+                    Box(Modifier.fillMaxWidth(((now - e.start).toFloat() / (e.end - e.start).coerceAtLeast(1)).coerceIn(0f, 1f)).fillMaxHeight().background(Ui.acc))
+                }
+                Text("${hhmm(e.start)} – ${hhmm(e.end)}" + (epg.getOrNull(ci + 1)?.let { "   ·   Luego: ${it.title}" } ?: ""), fontSize = 11.sp, color = Ui.dim, maxLines = 2, overflow = TextOverflow.Ellipsis)
+            }
+        }
         Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             PrimaryBtn("▶ Pantalla completa", onClick = onFull)
             Chip(if (fav) "★ Favorito" else "☆ Favorito") { b.st.toggleFav(x); b.bs.fv++ }
+            if (x.arch) Chip("⏪ Catch-up") { onCatchup(x) }
         }
         Text("Mantén OK sobre un canal para ver más opciones", fontSize = 11.sp, color = Ui.dim)
     }
@@ -310,15 +363,18 @@ fun LivePane(b: BCtx, x: Item, pv: ExoPlayer?, onFull: () -> Unit) {
 fun MoviePane(b: BCtx, x: Item, play: (List<PI>, Int) -> Unit) {
     val st = b.st
     val key = "movie:${x.id}"
-    val plot by produceState(x.plot, x.id) { value = withContext(Dispatchers.IO) { b.api.vodPlot(x.id) }.ifEmpty { x.plot } }
+    val info by produceState(Info(plot = x.plot), x.id) { value = withContext(Dispatchers.IO) { b.api.vodInfo(x.id) }.let { if (it.plot.isEmpty()) it.copy(plot = x.plot) else it } }
     var sv by remember(x.id) { mutableStateOf(0) }
     val fav = b.bs.fv >= 0 && st.isFav(x)
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            AsyncImage(model = x.icon, contentDescription = null, modifier = Modifier.width(110.dp).height(160.dp).clip(RoundedCornerShape(12.dp)), contentScale = ContentScale.Crop)
+            Logo(x, Modifier.width(110.dp).height(160.dp).clip(RoundedCornerShape(12.dp)), ContentScale.Crop)
             Text(x.name, fontSize = 18.sp, fontWeight = FontWeight.Bold, maxLines = 4, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
         }
-        Text(plot.ifEmpty { "Sin sinopsis del proveedor" }, fontSize = 13.sp, color = Ui.dim)
+        if (info.line().isNotEmpty()) Text(info.line(), fontSize = 12.sp, color = Ui.acc)
+        Text(info.plot.ifEmpty { "Sin sinopsis del proveedor" }, fontSize = 13.sp, color = Ui.dim)
+        if (info.cast.isNotEmpty()) Text("Reparto: ${info.cast}", fontSize = 12.sp, color = Ui.dim, maxLines = 3, overflow = TextOverflow.Ellipsis)
+        if (info.director.isNotEmpty()) Text("Director: ${info.director}", fontSize = 12.sp, color = Ui.dim, maxLines = 1, overflow = TextOverflow.Ellipsis)
         Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             PrimaryBtn(if (st.pos(key) > 0) "▶ Continuar" else "▶ Reproducir") { play(listOf(PI(x.name, b.api.playUrl(x), key, false, x)), 0) }
             Chip(if (fav) "★ Favorito" else "☆ Favorito") { st.toggleFav(x); b.bs.fv++ }
@@ -330,9 +386,9 @@ fun MoviePane(b: BCtx, x: Item, play: (List<PI>, Int) -> Unit) {
 @Composable
 fun SeriesPane(b: BCtx, x: Item, epFr: FocusRequester, play: (List<PI>, Int) -> Unit) {
     val api = b.api; val st = b.st; val bs = b.bs
-    val info by produceState<Pair<String, List<Ep>>?>(null, x.id) {
+    val info by produceState<Pair<Info, List<Ep>>?>(null, x.id) {
         value = null
-        value = withContext(Dispatchers.IO) { runCatching { api.series(x.id) }.getOrNull() ?: (x.plot to emptyList()) }
+        value = withContext(Dispatchers.IO) { runCatching { api.series(x.id) }.getOrNull() ?: (Info(plot = x.plot) to emptyList<Ep>()) }
     }
     val rt = bs.returned
     val last = remember(x.id, rt) { st.last(x) }
@@ -351,10 +407,13 @@ fun SeriesPane(b: BCtx, x: Item, epFr: FocusRequester, play: (List<PI>, Int) -> 
 
     Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            AsyncImage(model = x.icon, contentDescription = null, modifier = Modifier.width(80.dp).height(116.dp).clip(RoundedCornerShape(10.dp)), contentScale = ContentScale.Crop)
+            Logo(x, Modifier.width(80.dp).height(116.dp).clip(RoundedCornerShape(10.dp)), ContentScale.Crop)
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Text(x.name, fontSize = 17.sp, fontWeight = FontWeight.Bold, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                Text((info?.first ?: "").ifEmpty { "Sin sinopsis del proveedor" }, fontSize = 12.sp, color = Ui.dim, maxLines = 4, overflow = TextOverflow.Ellipsis)
+                val si = info?.first
+                if (si != null && si.line().isNotEmpty()) Text(si.line(), fontSize = 11.sp, color = Ui.acc, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text((si?.plot ?: x.plot).ifEmpty { "Sin sinopsis del proveedor" }, fontSize = 12.sp, color = Ui.dim, maxLines = 4, overflow = TextOverflow.Ellipsis)
+                if (si != null && si.cast.isNotEmpty()) Text("Reparto: ${si.cast}", fontSize = 11.sp, color = Ui.dim, maxLines = 2, overflow = TextOverflow.Ellipsis)
             }
         }
         Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -392,5 +451,33 @@ fun EpisodeRow(e: Ep, mark: String, m: Modifier, onLong: () -> Unit, onClick: ()
         Text("E${e.num}", fontSize = 12.sp, color = Ui.dim, modifier = Modifier.width(38.dp))
         Text(e.title.ifEmpty { "Capítulo ${e.num}" }, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
         Text(mark, color = Ui.acc)
+    }
+}
+
+@Composable
+fun CatchupDialog(api: Api, x: Item, close: () -> Unit, pick: (Epg) -> Unit) {
+    val list by produceState<List<Epg>?>(null, x.id) { value = withContext(Dispatchers.IO) { runCatching { api.epgFull(x.id) }.getOrDefault(emptyList()) } }
+    val now = System.currentTimeMillis() / 1000
+    val past = remember(list) { (list ?: emptyList()).filter { it.archive && it.end < now }.sortedByDescending { it.start } }
+    val fr = remember { FocusRequester() }
+    Dialog(onDismissRequest = close) {
+        LaunchedEffect(past.size) { delay(120); runCatching { fr.requestFocus() } }
+        Column(Modifier.clip(RoundedCornerShape(20.dp)).background(Ui.s1).padding(18.dp).widthIn(min = 300.dp, max = 460.dp).heightIn(max = 420.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Catch-up · ${x.name}", fontSize = 16.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            when {
+                list == null -> Text("Cargando programas…", color = Ui.dim)
+                past.isEmpty() -> Text("Este canal no tiene programas grabados disponibles", color = Ui.dim)
+                else -> LazyColumn(Modifier.weight(1f, fill = false), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    itemsIndexed(past) { i, e ->
+                        Row(Modifier.fillMaxWidth().then(if (i == 0) Modifier.focusRequester(fr) else Modifier).tv(RoundedCornerShape(10.dp)) { close(); pick(e) }.background(Ui.s2).padding(10.dp),
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Text(dayHhmm(e.start), fontSize = 12.sp, color = Ui.dim, modifier = Modifier.width(92.dp))
+                            Text(e.title, fontSize = 14.sp, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                        }
+                    }
+                }
+            }
+            Chip("Cerrar", m = Modifier.fillMaxWidth(), onClick = close)
+        }
     }
 }

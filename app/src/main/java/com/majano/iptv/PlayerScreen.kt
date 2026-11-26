@@ -22,6 +22,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Brush
@@ -31,6 +32,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -48,7 +50,9 @@ import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import androidx.media3.ui.SubtitleView
 import java.util.Locale
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 
 private val DIGITS = listOf(Key.Zero, Key.One, Key.Two, Key.Three, Key.Four, Key.Five, Key.Six, Key.Seven, Key.Eight, Key.Nine)
 private val MODES = listOf("Ajustar" to AspectRatioFrameLayout.RESIZE_MODE_FIT, "Zoom" to AspectRatioFrameLayout.RESIZE_MODE_ZOOM, "Llenar" to AspectRatioFrameLayout.RESIZE_MODE_FILL)
@@ -85,6 +89,12 @@ fun audioMatches(f: Format, want: String): Boolean {
     }
 }
 
+object PlayState { @Volatile var inPlayer = false }
+fun dayHhmm(s: Long): String = java.text.SimpleDateFormat("dd/MM HH:mm", Locale.getDefault()).format(java.util.Date(s * 1000))
+fun hhmm(s: Long): String = java.text.SimpleDateFormat("HH:mm", Locale.getDefault()).format(java.util.Date(s * 1000))
+private val QN = listOf("Máxima (4K)", "1080p", "720p", "480p")
+fun qDims(q: Int): Pair<Int, Int> = when (q) { 1 -> 1920 to 1080; 2 -> 1280 to 720; 3 -> 854 to 480; else -> 3840 to 2160 }
+
 // Potenciador de volumen (LoudnessEnhancer): sube el nivel de todo lo que suena, voces incluidas
 object Boost {
     private val map = java.util.WeakHashMap<ExoPlayer, LoudnessEnhancer>()
@@ -114,8 +124,9 @@ fun newPlayer(ctx: Context, st: Store, preview: Boolean): ExoPlayer {
     }.build()
     val rf = DefaultRenderersFactory(ctx).setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON).setEnableDecoderFallback(true)
     return ExoPlayer.Builder(ctx, rf).setLoadControl(lc).setHandleAudioBecomingNoisy(!preview).setAudioAttributes(AudioAttributes.DEFAULT, true).build().also {
+        val (mw, mh) = if (preview) (1280 to 720) else qDims(st.quality)
         val b = it.trackSelectionParameters.buildUpon()
-            .setMaxVideoSize(if (preview) 1280 else 3840, if (preview) 720 else 2160).setForceHighestSupportedBitrate(!preview)
+            .setMaxVideoSize(mw, mh).setForceHighestSupportedBitrate(!preview)
             .setPreferredAudioLanguages(st.audioLang)   // por defecto español
             .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, preview || !st.subs)   // subtítulos apagados por defecto
         if (!preview) b.setViewportSize(Int.MAX_VALUE, Int.MAX_VALUE, true)   // 4K / máxima calidad, sin limitar al tamaño de pantalla
@@ -127,7 +138,7 @@ fun newPlayer(ctx: Context, st: Store, preview: Boolean): ExoPlayer {
 }
 
 @Composable
-fun PlayerScreen(q: List<PI>, start: Int, st: Store, back: () -> Unit) {
+fun PlayerScreen(q: List<PI>, start: Int, st: Store, api: Api, back: () -> Unit) {
     val ctx = LocalContext.current
     val view = LocalView.current
     var idx by remember { mutableStateOf(start) }
@@ -156,18 +167,30 @@ fun PlayerScreen(q: List<PI>, start: Int, st: Store, back: () -> Unit) {
     var picked by remember { mutableStateOf(false) }
     var dlg by remember { mutableStateOf(0) }   // 1 idioma de audio, 2 subtítulos, 3 volumen
     var boost by remember { mutableStateOf(st.boostMb) }
+    var autoNext by remember { mutableStateOf(true) }
+    val autoNextS = rememberUpdatedState(autoNext)
+    var countdown by remember { mutableStateOf(-1) }
+    var sleepMin by remember { mutableStateOf(0) }
+    var quality by remember { mutableStateOf(st.quality) }
+    var res by remember { mutableStateOf("") }
+    var banner by remember { mutableStateOf(false) }
+    val nf = remember { FocusRequester() }
+    val epg by produceState<List<Epg>>(emptyList(), cur.item.id, cur.live) {
+        value = if (cur.live) withContext(Dispatchers.IO) { runCatching { api.epg(cur.item.id) }.getOrDefault(emptyList()) } else emptyList()
+    }
     val fr = remember { FocusRequester() }
     val pf = remember { FocusRequester() }
 
     // Pantalla completa inmersiva y horizontal
     DisposableEffect(Unit) {
+        PlayState.inPlayer = true
         val act = ctx as? Activity
         val prev = act?.requestedOrientation ?: ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
         act?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
         val ic = act?.window?.let { WindowCompat.getInsetsController(it, view) }
         ic?.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         ic?.hide(WindowInsetsCompat.Type.systemBars())
-        onDispose { ic?.show(WindowInsetsCompat.Type.systemBars()); act?.requestedOrientation = prev }
+        onDispose { PlayState.inPlayer = false; ic?.show(WindowInsetsCompat.Type.systemBars()); act?.requestedOrientation = prev }
     }
 
     val audioGs = tracks.groups.filter { it.type == C.TRACK_TYPE_AUDIO }
@@ -200,7 +223,7 @@ fun PlayerScreen(q: List<PI>, start: Int, st: Store, back: () -> Unit) {
                     val c = q[idxS.value]
                     if (c.live) { attempt = attS.value + 1; return }
                     st.setSeen(c.key, true); st.savePos(c.key, 0, 0)   // fin del capítulo -> siguiente automático
-                    if (idxS.value < q.lastIndex) { attempt = 0; idx = idxS.value + 1 } else back()
+                    if (idxS.value < q.lastIndex) { if (autoNextS.value) { attempt = 0; idx = idxS.value + 1 } } else back()
                 }
             }
             override fun onPlayWhenReadyChanged(p: Boolean, r: Int) { playing = p }
@@ -235,7 +258,7 @@ fun PlayerScreen(q: List<PI>, start: Int, st: Store, back: () -> Unit) {
     LaunchedEffect(idx, attempt) {   // carga; en vivo reintenta y a la 3.ª prueba cambia a .ts
         if (st.external) return@LaunchedEffect
         val c = q[idx]
-        if (attempt > 0) delay(1500) else { err = ""; warn = ""; picked = false }
+        if (attempt > 0) delay(1500) else { err = ""; warn = ""; picked = false; autoNext = true; countdown = -1 }
         val u = if (c.live && attempt >= 2) c.url.replace(".m3u8", ".ts") else c.url
         ex.setMediaItem(MediaItem.fromUri(u), if (c.live) 0L else st.pos(c.key))   // reanuda donde lo dejó
         ex.prepare(); ex.playWhenReady = true
@@ -246,11 +269,18 @@ fun PlayerScreen(q: List<PI>, start: Int, st: Store, back: () -> Unit) {
             delay(1000)
             val c = q[idxS.value]; val p = ex.currentPosition
             pos = if (c.live) "EN VIVO" else "${fmt(p)} / ${fmt(ex.duration)}"
+            val dur = ex.duration
+            countdown = if (!c.live && c.epId.isNotEmpty() && idxS.value < q.lastIndex && autoNextS.value && dur > 0 && dur - p in 1..12_000) ((dur - p) / 1000 + 1).toInt() else -1
+            val vg = tracks.groups.firstOrNull { it.type == C.TRACK_TYPE_VIDEO && it.isSelected }
+            res = vg?.let { g -> (0 until g.length).firstOrNull { g.isTrackSelected(it) }?.let { g.getTrackFormat(it).height } }?.takeIf { it > 0 }?.let { "${it}p" } ?: ""
             if (!c.live && p > 0 && (p / 1000) % 10 == 0L) save(c)
         }
     }
     LaunchedEffect(tick) { show = true; delay(5000); if (panel == 0 || panel == 3) show = false }
     LaunchedEffect(show) { delay(50); runCatching { if (show) pf.requestFocus() else fr.requestFocus() } }
+    LaunchedEffect(countdown > 0) { delay(80); runCatching { if (countdown > 0) nf.requestFocus() else fr.requestFocus() } }
+    LaunchedEffect(sleepMin) { if (sleepMin > 0) { delay(sleepMin * 60_000L); ex.playWhenReady = false; back() } }
+    LaunchedEffect(idx) { if (q[idx].live) { banner = true; delay(3500); banner = false } }   // aviso al cambiar de canal
     LaunchedEffect(msg) { if (msg.isNotEmpty()) { delay(900); msg = "" } }
     LaunchedEffect(num) { if (num.isNotEmpty()) { delay(1800); val n = num.toIntOrNull() ?: 0; num = ""; if (n in 1..q.size) jump(n - 1) } }
     BackHandler { if (panel != 0) panel = 0 else back() }
@@ -293,7 +323,13 @@ fun PlayerScreen(q: List<PI>, start: Int, st: Store, back: () -> Unit) {
         if (show) Column(Modifier.align(Alignment.BottomCenter).fillMaxWidth()
             .background(Brush.verticalGradient(listOf(Color.Transparent, Color(0xEE000000)))).padding(horizontal = 24.dp, vertical = 20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text(cur.title, fontSize = 18.sp, maxLines = 1)
-            Text(pos + if (cur.live) "   ·   canal ${idx + 1}/${q.size}" else "", fontSize = 13.sp, color = Ui.dim)
+            Text(pos + (if (res.isNotEmpty()) "   ·   $res" else "") + (if (cur.live) "   ·   canal ${idx + 1}/${q.size}" else ""), fontSize = 13.sp, color = Ui.dim)
+            if (cur.live && epg.isNotEmpty()) {
+                val now = System.currentTimeMillis() / 1000
+                val ci = epg.indexOfFirst { now in it.start until it.end }
+                if (ci >= 0) Text("Ahora: ${epg[ci].title}  (${hhmm(epg[ci].start)}–${hhmm(epg[ci].end)})" + (epg.getOrNull(ci + 1)?.let { "   ·   Luego: ${it.title}" } ?: ""),
+                    fontSize = 13.sp, color = Ui.txt, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
             Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 Chip("⏮ Anterior") { go(-1) }
                 if (!cur.live) Chip("⏪ 10s") { seek(-10_000) }
@@ -307,6 +343,8 @@ fun PlayerScreen(q: List<PI>, start: Int, st: Store, back: () -> Unit) {
                 Chip("Audio: $curAudio") { dlg = 1 }
                 Chip(if (subs) "Subtítulos: Sí" else "Subtítulos: No") { dlg = 2 }
                 Chip(if (boost == 0) "Volumen: normal" else "Volumen: +${boost / 100} dB") { dlg = 3 }
+                Chip("Calidad: ${QN[quality]}") { dlg = 4 }
+                Chip(if (sleepMin == 0) "Dormir: no" else "Dormir: $sleepMin min") { sleepMin = when (sleepMin) { 0 -> 15; 15 -> 30; 30 -> 60; 60 -> 90; else -> 0 }; tick++ }
                 Chip("Imagen: ${MODES[rm].first}") { rm = (rm + 1) % MODES.size }
                 if (!cur.live) Chip("Velocidad: ${SPEEDS[si]}x") { si = (si + 1) % SPEEDS.size; ex.setPlaybackSpeed(SPEEDS[si]) }
                 Chip("Externo") { ex.playWhenReady = false; external(cur) }
@@ -320,6 +358,15 @@ fun PlayerScreen(q: List<PI>, start: Int, st: Store, back: () -> Unit) {
                             lang2(g.getTrackFormat(0).language)?.let { st.audioLang = it }   // recuerda tu idioma para lo siguiente
                         }
                     }) { dlg = 0; tick++ }
+            }
+            if (dlg == 4) {
+                ActionDialog("Calidad de video", QN.mapIndexed { i, n ->
+                    act((if (quality == i) "● " else "") + n) {
+                        quality = i; st.quality = i
+                        val (w2, h2) = qDims(i)
+                        ex.trackSelectionParameters = ex.trackSelectionParameters.buildUpon().setMaxVideoSize(w2, h2).build()
+                    }
+                }) { dlg = 0; tick++ }
             }
             if (dlg == 3) {
                 ActionDialog("Potenciar volumen", listOf(0 to "Normal", 600 to "Alto (+6 dB)", 1000 to "Muy alto (+10 dB)", 1500 to "Máximo (+15 dB)").map { (mb, name) ->
@@ -343,6 +390,22 @@ fun PlayerScreen(q: List<PI>, start: Int, st: Store, back: () -> Unit) {
                 acts += act("Tamaño del texto: ${SIZES[ss]}x  (cambiar)") { ss = (ss + 1) % SIZES.size }
                 ActionDialog(if (gs.isEmpty()) "Subtítulos (este contenido no trae)" else "Subtítulos", acts) { dlg = 0; tick++ }
             }
+        }
+        if (banner && !show && panel != 3 && cur.live) Row(Modifier.align(Alignment.BottomStart).padding(24.dp).background(Color(0xEE0A0E17), RoundedCornerShape(16.dp)).padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Logo(cur.item, Modifier.size(56.dp).clip(RoundedCornerShape(10.dp)).background(Ui.s2))
+            Column {
+                Text("${idx + 1}   ${st.nameOf(cur.item)}", fontSize = 18.sp, fontWeight = FontWeight.Bold, maxLines = 1)
+                val nowS = System.currentTimeMillis() / 1000
+                val cj = epg.indexOfFirst { nowS in it.start until it.end }
+                if (cj >= 0) Text("Ahora: ${epg[cj].title}" + (epg.getOrNull(cj + 1)?.let { "  ·  Luego: ${it.title}" } ?: ""), fontSize = 12.sp, color = Ui.dim, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+        }
+        if (countdown > 0) Row(Modifier.align(Alignment.BottomEnd).padding(end = 24.dp, bottom = 150.dp).background(Color(0xEE0A0E17), RoundedCornerShape(16.dp)).padding(14.dp),
+            verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("Siguiente capítulo en $countdown s", fontSize = 14.sp)
+            PrimaryBtn("Ver ahora", Modifier.focusRequester(nf)) { go(1) }
+            Chip("Cancelar") { autoNext = false; countdown = -1 }
         }
         if (panel == 3) {
             val ls = rememberLazyListState()

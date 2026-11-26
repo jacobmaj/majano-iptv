@@ -7,8 +7,13 @@ import java.net.HttpURLConnection
 import java.net.URL
 import kotlin.concurrent.thread
 
-data class Item(val id: String, val name: String, val icon: String, val cat: String, val kind: String, val ext: String = "mp4", val plot: String = "", val url: String = "")
+data class Item(val id: String, val name: String, val icon: String, val cat: String, val kind: String, val ext: String = "mp4", val plot: String = "", val url: String = "", val arch: Boolean = false)
 data class Ep(val id: String, val title: String, val season: Int, val num: Int, val ext: String, val plot: String)
+
+data class Epg(val title: String, val desc: String, val start: Long, val end: Long, val startStr: String = "", val archive: Boolean = false)
+data class Info(val plot: String = "", val year: String = "", val rating: String = "", val genre: String = "", val duration: String = "", val cast: String = "", val director: String = "") {
+    fun line() = listOf(year, if (rating.isNotBlank() && rating != "0") "★ $rating" else "", genre, duration).filter { it.isNotBlank() }.joinToString("  ·  ")
+}
 
 fun JSONObject.s(k: String) = if (isNull(k)) "" else optString(k)
 val ADULT = Regex("(?i)xxx|adult|porn|18\\+|\\+18|erot|\\bsex\\b")
@@ -60,7 +65,7 @@ class Api(url: String, val u: String, val p: String, private val dir: File) {
             val o = a.getJSONObject(it)
             val s = kind == "series"
             Item(o.s(if (s) "series_id" else "stream_id"), o.s("name"), o.s(if (s) "cover" else "stream_icon"), o.s("category_id"), kind,
-                o.s("container_extension").ifEmpty { "mp4" }, o.s("plot"))
+                o.s("container_extension").ifEmpty { "mp4" }, o.s("plot"), "", kind == "live" && o.s("tv_archive") == "1")
         }
     }
 
@@ -86,7 +91,50 @@ class Api(url: String, val u: String, val p: String, private val dir: File) {
         return xs.map { it.cat }.distinct().associateWith { it } to xs
     }
 
-    fun series(id: String): Pair<String, List<Ep>> {
+    private fun infoOf(o: JSONObject?): Info {
+        if (o == null) return Info()
+        fun first(vararg ks: String) = ks.map { o.s(it) }.firstOrNull { it.isNotBlank() } ?: ""
+        return Info(first("plot", "description"), first("releasedate", "releaseDate", "release_date", "year").take(4),
+            first("rating", "rating_5based"), first("genre"), first("duration"), first("cast", "actors"), first("director"))
+    }
+    private fun b64(s: String) = runCatching { String(android.util.Base64.decode(s, android.util.Base64.DEFAULT)) }.getOrDefault(s).ifBlank { s }
+
+    // Guía de programación (EPG) del canal: ahora y siguientes
+    fun epg(id: String): List<Epg> {
+        if (m3u) return emptyList()
+        val a = JSONObject(get("&action=get_short_epg&stream_id=$id&limit=4")).optJSONArray("epg_listings") ?: return emptyList()
+        return (0 until a.length()).mapNotNull {
+            val o = a.getJSONObject(it)
+            val s = o.s("start_timestamp").toLongOrNull(); val e = o.s("stop_timestamp").toLongOrNull()
+            if (s == null || e == null) null else Epg(b64(o.s("title")), b64(o.s("description")), s, e)
+        }
+    }
+
+    private val epgCache = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, List<Epg>>>()
+    // EPG con caché de 5 min (para mostrar "ahora" en la lista de canales sin saturar al proveedor)
+    fun epgCached(id: String): List<Epg> {
+        val c = epgCache[id]; val now = System.currentTimeMillis()
+        if (c != null && now - c.first < 300_000) return c.second
+        val l = runCatching { epg(id) }.getOrDefault(emptyList()); epgCache[id] = now to l; return l
+    }
+    // Programación completa del canal (incluye lo ya emitido) para catch-up
+    fun epgFull(id: String): List<Epg> {
+        if (m3u) return emptyList()
+        val a = JSONObject(get("&action=get_simple_data_table&stream_id=$id")).optJSONArray("epg_listings") ?: return emptyList()
+        return (0 until a.length()).mapNotNull {
+            val o = a.getJSONObject(it)
+            val s = o.s("start_timestamp").toLongOrNull(); val e = o.s("stop_timestamp").toLongOrNull()
+            if (s == null || e == null) null else Epg(b64(o.s("title")), b64(o.s("description")), s, e, o.s("start"), o.s("has_archive") == "1")
+        }
+    }
+    fun catchupUrl(i: Item, e: Epg): String {
+        val mins = ((e.end - e.start) / 60).coerceAtLeast(1)
+        val s = e.startStr
+        val ts = s.substring(0, 10) + ":" + s.substring(11, 13) + "-" + s.substring(14, 16)
+        return "$base/timeshift/$u/$p/$mins/$ts/${i.id}.ts"
+    }
+
+    fun series(id: String): Pair<Info, List<Ep>> {
         val o = JSONObject(get("&action=get_series_info&series_id=$id"))
         val out = ArrayList<Ep>()
         fun add(s: Int, arr: JSONArray) {
@@ -98,10 +146,10 @@ class Api(url: String, val u: String, val p: String, private val dir: File) {
         val m = o.optJSONObject("episodes")
         if (m != null) m.keys().forEach { k -> add(k.toIntOrNull() ?: 0, m.getJSONArray(k)) }
         else o.optJSONArray("episodes")?.let { a -> for (i in 0 until a.length()) a.optJSONArray(i)?.let { add(i + 1, it) } }
-        return (o.optJSONObject("info")?.s("plot") ?: "") to out.sortedWith(compareBy({ it.season }, { it.num }))
+        return infoOf(o.optJSONObject("info")) to out.sortedWith(compareBy({ it.season }, { it.num }))
     }
 
-    fun vodPlot(id: String) = if (m3u) "" else runCatching { JSONObject(get("&action=get_vod_info&vod_id=$id")).optJSONObject("info")?.s("plot") }.getOrNull() ?: ""
+    fun vodInfo(id: String): Info = if (m3u) Info() else runCatching { infoOf(JSONObject(get("&action=get_vod_info&vod_id=$id")).optJSONObject("info")) }.getOrNull() ?: Info()
 
     fun url(kind: String, id: String, ext: String) = when (kind) {
         "live" -> "$base/live/$u/$p/$id.m3u8"
